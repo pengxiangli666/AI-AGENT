@@ -80,6 +80,24 @@ async def test_all_capabilities_dropped():
         assert line.split()[-1] == "0000000000000000", line
 
 
-async def test_fork_bomb_is_contained_by_pids_limit():
-    r = await run_in_sandbox({}, ":(){ :|:& };:", SandboxConfig(mode="docker", timeout=5, pids_limit=64))
-    assert r.timed_out or r.exit_code != 0  # contained: host stays up, job ends
+async def test_pids_limit_blocks_process_explosion():
+    """Keep forking until the kernel refuses; the cgroup pids limit must stop us well below 500."""
+    code = (
+        "import os, time\n"
+        "pids = []\n"
+        "try:\n"
+        "    for _ in range(500):\n"
+        "        pid = os.fork()\n"
+        "        if pid == 0:\n"
+        "            time.sleep(5)\n"
+        "            os._exit(0)\n"
+        "        pids.append(pid)\n"
+        "    print('NOT-BLOCKED', len(pids))\n"
+        "except OSError as e:\n"
+        "    print('BLOCKED', len(pids), e.errno)\n"
+    )
+    r = await run_in_sandbox({"fork.py": code}, "python fork.py", SandboxConfig(mode="docker", timeout=20, pids_limit=64))
+    out = r.stdout + r.stderr
+    assert "BLOCKED" in r.stdout and "NOT-BLOCKED" not in r.stdout, out
+    assert int(r.stdout.split()[1]) < 64, out  # could not exceed the configured limit
+    assert not r.timed_out

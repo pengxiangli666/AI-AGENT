@@ -56,7 +56,7 @@ RAG：`python -m rag.ingest ./docs_corpus` 建索引（首次会下载 BGE-M3 �
 
 ```bash
 pytest -q                                                     # 无需 Docker/Postgres 的全部测试
-TEST_POSTGRES_URI=postgresql://agent:agent@localhost:5432/agent pytest tests/test_postgres_checkpointer.py
+TEST_POSTGRES_URI=postgresql://agent:agent@localhost:5433/agent pytest tests/test_postgres_checkpointer.py
 bash scripts/build_sandbox.sh && pytest tests/test_docker_integration.py -v   # 真 Docker 加固验证
 ```
 
