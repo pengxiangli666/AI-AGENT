@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+      POSTGRES_DB: agent
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nginx:
+    image: nginx:alpine
+    container_name: coding-agent-nginx-1
+    ports:
+      - "8080:80"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/conf.d:/etc/nginx/conf.d
+    networks:
+      - default
+      - faas
+
+networks:
+  # Deployed apps live ONLY on this network. `internal: true` means containers on it
+  # cannot reach the internet; nginx is attached to it as well as to the default
+  # network, which is how requests get in.
+  faas:
+    name: agent-faas
+    internal: true
+
+volumes:
+  pgdata:

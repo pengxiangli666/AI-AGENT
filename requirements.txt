@@ -1,0 +1,27 @@
+# Orchestration
+langgraph>=0.2.60
+langgraph-checkpoint-postgres>=2.0.0
+psycopg[binary,pool]>=3.2
+langchain-core>=0.3
+langchain-openai>=0.2
+
+# MCP + service layer
+mcp>=1.2.0,<2
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
+pydantic>=2.7
+
+# Browser tool
+playwright>=1.47
+beautifulsoup4>=4.12
+
+# RAG
+rank_bm25>=0.2.2
+faiss-cpu>=1.8
+numpy>=1.26
+sentence-transformers>=3.0   # BGE-M3 embedder + bge-reranker (optional, heavy)
+
+# Dev
+pytest>=8.0
+pytest-asyncio>=0.24
