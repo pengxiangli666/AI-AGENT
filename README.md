@@ -1,89 +1,174 @@
-# coding-agent：企业级 AI Coding Agent 复现
+# coding-agent
 
-LangGraph 多角色循环（Planner → Coder → Reviewer → Executor → Deployer）+ MCP 工具服务（SSE/HTTP）+ Docker/Seccomp 沙箱 + Nginx FaaS 部署 + BM25/BGE-M3 混合检索。
+An AI coding agent that plans, writes, reviews, runs and (optionally) deploys code.
+
+A LangGraph state machine drives four roles (Planner, Coder, Reviewer, Executor). Generated code runs in a hardened Docker sandbox. HTTP services can be deployed behind Nginx after a human approves. Tools are exposed over MCP (SSE and streamable HTTP), and a hybrid retrieval stack (BM25 + BGE-M3 + reranker) serves documentation search.
 
 ```
-                 ┌────────────────────── agent (LangGraph) ──────────────────────┐
- requirement ──▶ │ planner ─▶ coder ─▶ reviewer ─▶ executor ─▶ [人工审批] ─▶ deployer │
-                 │              ▲  └─ 不通过 ─┘        │ 失败(带 stderr)                │
-                 │              └─────── 重试(≤ max_attempts) ◀──┘                    │
-                 │   PostgresSaver 每步落盘 · interrupt_before=["deployer"]            │
-                 └──────────────┬────────────────────────────────────────────────┘
-                                │ MCP (SSE / streamable HTTP)
-                 ┌──────────────▼───────── mcp_server (FastAPI) ─────────────────┐
+                 ┌─────────────────────── agent (LangGraph) ───────────────────────┐
+ requirement ──▶ │ planner ─▶ coder ─▶ reviewer ─▶ executor ─┬─▶ [human approval] ─▶ deployer │
+                 │             ▲  └─ rejected ─┘     │        └─▶ finish (library / CLI)      │
+                 │             └──── retry (≤ max_attempts, stderr fed back) ◀─┘              │
+                 │      PostgresSaver checkpoint every step · interrupt_before=["deployer"]   │
+                 └───────────────┬─────────────────────────────────────────────────┘
+                                 │ MCP (SSE / streamable HTTP)
+                 ┌───────────────▼────────── mcp_server (FastAPI) ─────────────────┐
                  │ run_in_sandbox · terminal_start/logs/kill · browse_page · ui_check │
-                 │ deploy_faas · undeploy_faas · search_docs   (装饰器自动生成 schema)   │
-                 └───────┬──────────────────┬─────────────────────┬──────────────┘
-                         │                  │                     │
-              sandbox/runner.py     Playwright + DOM 精简    sandbox/faas.py ─▶ Nginx
-        docker run --cap-drop ALL            (SSRF 过滤)        (internal 网络, 动态 conf)
-        seccomp · read-only · no-net
+                 │ deploy_faas · list_deployments · undeploy_faas · search_docs        │
+                 │ (decorator + docstring → JSON Schema, auto-discovered)             │
+                 └──────┬──────────────────┬──────────────────────┬───────────────┘
+                        │                  │                      │
+              sandbox/runner.py     Playwright + DOM trimming   sandbox/faas.py ─▶ Nginx
+        docker run --cap-drop ALL          (SSRF guard)          (internal network, dynamic conf)
+        seccomp · read-only · no network
 ```
 
-## 目录
+## What it can do
 
-| 路径 | 内容 |
+| Task type | Behavior |
 |---|---|
-| `agent/` | `state.py` StateSchema；`nodes.py` 五个节点 + 条件边；`graph.py` 建图、PostgresSaver、回滚；`llm.py` 分层模型路由；`main.py` CLI |
-| `mcp_server/` | `registry.py` 自动发现工具并生成 JSON Schema；`server.py` FastAPI + SSE + streamable HTTP；`tools/` 各工具 |
-| `sandbox/` | `runner.py` 沙箱执行 + 异步 PID/日志流；`faas.py` 部署与 Nginx；`Dockerfile`；`seccomp.json` |
-| `rag/` | `index.py` BM25+Faiss+RRF+重排；`eval.py` 消融评测；`ingest.py` 建索引 |
-| `scripts/` | `gen_seccomp.py` 生成 seccomp；`build_sandbox.sh` 构建镜像并测启动耗时 |
-| `tests/` | 单元 / 端到端 / Postgres / Docker 集成测试 |
+| Libraries, algorithms, utilities | Writes code and tests, runs them in the sandbox, retries on failure. Ends as `completed`, no approval or deploy. |
+| CLI tools and scripts | Same as above. |
+| HTTP web services (FastAPI, Flask, …) | Pauses for approval, then deploys to `http://app-<id>.localhost:8080`. |
 
-## 快速开始（Linux / WSL2）
+The Planner decides with a `deployable` flag whether the result is a long-running HTTP service. If the flag is missing, the task is treated as deployable.
+
+Current limits:
+
+- The sandbox has no network, so only the standard library and packages baked into the image are available.
+- Deployment start-up detection supports Python apps only.
+- One container per deployment. No database or multi-service apps.
+- The agent graph itself calls `run_in_sandbox` and `deploy_faas`. The retrieval and browser tools are available over MCP but are not yet part of the Coder's loop.
+
+## Layout
+
+| Path | Contents |
+|---|---|
+| `agent/` | `state.py` state schema · `nodes.py` planner / coder / reviewer / executor / deployer / finish + conditional edges · `graph.py` graph, PostgresSaver, rollback · `llm.py` tiered model routing · `main.py` CLI |
+| `mcp_server/` | `registry.py` tool auto-discovery and schema generation · `server.py` FastAPI + SSE + streamable HTTP · `tools/` one file per tool group |
+| `sandbox/` | `runner.py` sandboxed execution and async PID/log streaming · `faas.py` deployment and Nginx orchestration · `Dockerfile` · `seccomp.json` |
+| `rag/` | `chunking.py` · `ingest.py` index build · `index.py` BM25 + Faiss + RRF + rerank · `relevance.py` gold matching · `eval.py` evaluation |
+| `scripts/` | `build_sandbox.sh` · `gen_seccomp.py` · `gen_eval.py`, `refine_eval.py`, `rag_ablation.py` evaluation pipeline |
+| `tests/` | Unit, end-to-end, Postgres and Docker integration tests |
+
+## Quick start (Linux / WSL2)
+
+Requirements: Python 3.11+, Docker, an OpenAI API key.
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt && playwright install chromium
-cp .env.example .env            # 填 OPENAI_API_KEY，然后: set -a; . ./.env; set +a
+cp .env.example .env              # fill in OPENAI_API_KEY (keep .env out of git)
 
-docker compose up -d            # postgres + nginx（nginx 挂在 internal 网络 agent-faas 上）
-bash scripts/build_sandbox.sh   # 构建沙箱镜像 + 打印 10 次启动耗时
+docker compose up -d              # Postgres (host port 5433) + Nginx (host port 8080)
+bash scripts/build_sandbox.sh     # build the sandbox image, print 10 start-up timings
 
-python -m mcp_server.server &   # MCP 服务，默认 :8765  (/sse, /http/mcp, /healthz, /tools)
-python -m agent.main "写一个 FastAPI 服务，GET /health 返回 {\"ok\": true}，带测试" --thread demo1
-# 到部署前会暂停，输入 a 批准 / r 拒绝 / b 回滚到某个 checkpoint
-# 进程中途挂了：python -m agent.main --thread demo1 --resume
+python -m mcp_server.server &     # MCP server on :8765  (/sse, /http/mcp, /healthz, /tools)
+python -m agent.main "Write a FastAPI service with GET /health returning {\"ok\": true}, with tests" --thread demo1
 ```
 
-部署后的 URL 形如 `http://app-1a2b3c4d.localhost:8080`（`*.localhost` 浏览器和 curl 会自动解析到本机）。
+CLI options:
 
-RAG：`python -m rag.ingest ./docs_corpus` 建索引（首次会下载 BGE-M3 约 2GB），MCP 工具 `search_docs` 即可用。
-没有 GPU/不想下模型时，`RAG_BACKEND=hashing` 走离线替身（仅用于冒烟，**不能用来报召回率**）。
+| Option | Meaning |
+|---|---|
+| `--thread ID` | Name of the run. Reuse it to resume. |
+| `--max-attempts N` | Retry cap for the Coder loop (default 3). |
+| `--out DIR` | Write the generated files to `DIR` when the run ends. |
+| `--resume` | Continue a thread after a crash: `python -m agent.main --thread demo1 --resume` |
 
-## 测试
+At the approval step: `a` approves, `r` rejects, `b` rolls back to an earlier checkpoint.
+
+Keep the MCP server bound to `127.0.0.1` (the default). It can run code and deploy containers and has no authentication.
+
+## Configuration
+
+All settings live in `.env` (see `.env.example`).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY`, `OPENAI_BASE_URL` | – | Credentials and endpoint, shared by both tiers |
+| `MODEL_ROUTER` | `gpt-4o-mini` | Cheap tier: Planner, Reviewer, Deployer |
+| `MODEL_GENERATOR` | `gpt-4o` | Strong tier: Coder |
+| `POSTGRES_URI` | `…@localhost:5433/agent` | Checkpoint store (database must be UTF8) |
+| `MCP_HOST`, `MCP_PORT`, `MCP_URL` | `127.0.0.1`, `8765` | MCP server |
+| `SANDBOX_IMAGE`, `SANDBOX_TIMEOUT` | `coding-agent-sandbox:latest`, `60` | Sandbox image and run timeout (s) |
+| `FAAS_DOMAIN`, `FAAS_PUBLIC_PORT` | `localhost`, `8080` | Deployed-app hostnames |
+| `NGINX_CONF_DIR` | `./deploy/nginx/conf.d` | Where per-app Nginx configs are written |
+| `EMBED_MODEL`, `RERANK_MODEL`, `RAG_INDEX_DIR` | BGE-M3, bge-reranker-v2-m3, `./data/index` | Retrieval models and index location |
+| `RAG_BACKEND` | – | `hashing` selects an offline stand-in for smoke tests only |
+| `HF_TOKEN` | – | Optional. Avoids Hugging Face rate limits on model download |
+
+## Design notes
+
+**Self-correcting loop.** A Reviewer rejection or a non-zero Executor exit both return to the Coder, with the reviewer feedback or the real stderr added to the prompt. `max_attempts` bounds the loop and ends in `give_up`, which shows the last sandbox output. Generated files pass `validate_files` first (path traversal, file count, size), so invalid output does not cost a Reviewer call.
+
+**Resume after a crash.** `AsyncPostgresSaver` writes a checkpoint at every step. A new process with the same `thread_id` continues from the last one; after an Executor crash only the Executor reruns, with no new planning or generation. `tests/test_postgres_checkpointer.py` proves this with an LLM that has no replies queued.
+
+**Human approval.** The graph stops before `deployer` (`interrupt_before`). The Deployer also checks `approved_by_human is True`, so a mistaken resume still cannot deploy. Rollback forks from a past checkpoint with `aupdate_state`.
+
+**Tiered models.** An explicit `ROLE_TIER` table maps planner, reviewer and deployer to the cheap tier and coder to the strong tier. `ModelRouter.usage` records real token counts per tier. Both tiers use the OpenAI-compatible endpoint.
+
+**MCP tools.** `@mcp_tool` plus `autodiscover` means adding a tool is adding one file under `tools/`. The `Args:` section of the docstring becomes parameter descriptions in the JSON Schema, and a test checks that it matches the schema FastMCP publishes. Both SSE and streamable HTTP are served.
+
+**Sandbox hardening.** Each run uses `--network none`, `--cap-drop ALL`, `no-new-privileges`, a custom seccomp profile, a read-only root filesystem with tmpfs scratch space, a non-root user (10001), and pids, memory and CPU limits. Timeouts kill the process group and the container. `terminal_start/logs/kill` give asynchronous PIDs and incremental logs by polling.
+
+**Seccomp profile.** `scripts/gen_seccomp.py` starts from Docker's default allowlist (default deny), removes `ptrace`, `process_vm_*`, `kcmp`, `pidfd_getfd` and similar cross-process calls, and restricts sockets to UNIX, INET, INET6 and NETLINK. `mount`, `unshare`, `setns` and `bpf` stay blocked by the dropped capabilities.
+
+**Deployment.** Deployed containers sit only on the `internal: true` network `agent-faas`, so they cannot reach the internet. Nginx is attached to both networks. Each app gets a server block that uses Docker DNS with a variable `proxy_pass`. The sequence is write config, `nginx -t`, reload; any failure rolls back the container and the config. A readiness probe waits for the app to answer HTTP before the URL is returned.
+
+**Browser tools.** `browse_page` trims the DOM (scripts, styles, navigation, footers, cookie banners) and keeps headings, paragraphs, code and links, with a length cap. The SSRF guard resolves every host and refuses private, loopback, link-local (including the cloud metadata address), reserved and multicast addresses and non-HTTP(S) schemes. The only exception is a deployed app host `app-<8 hex>.<FAAS_DOMAIN>` on the public port. Ordinary public sites are allowed. `ui_check` runs assertions against a page and reports pass or fail.
+
+## Retrieval
+
+Pipeline: BM25 (identifiers split on snake_case and CamelCase, CJK bigrams) and BGE-M3 dense vectors (Faiss exact inner product) are fused with RRF (k=60). The top 30 fused candidates are reranked with bge-reranker-v2-m3.
+
+Chunking: fixed-size by default. Heading-aware chunking (`rag/chunking.py`, `--split heading`) and header-prefixed chunks (`--header`) are available.
+
+Build an index:
 
 ```bash
-pytest -q                                                     # 无需 Docker/Postgres 的全部测试
-TEST_POSTGRES_URI=postgresql://agent:agent@localhost:5433/agent pytest tests/test_postgres_checkpointer.py
-bash scripts/build_sandbox.sh && pytest tests/test_docker_integration.py -v   # 真 Docker 加固验证
+python -m rag.ingest ./docs_corpus            # first run downloads BGE-M3 (~2 GB)
+python -m rag.ingest ./docs_corpus --split heading --header
 ```
 
-## 设计要点（面试可讲）
+### Evaluation
 
-- **自我纠错循环**：Reviewer 不通过 或 Executor 退出码非 0 都回到 Coder，并把 reviewer 意见 / 真实 stderr 拼进 prompt；`max_attempts`（默认 3）兜底防死循环，超限进入 `give_up`。Coder 产出的文件先过 `validate_files`（路径穿越、数量、大小），不合格直接回炉，不浪费 Reviewer 调用。
-- **断点续跑**：`AsyncPostgresSaver` 每个超步写 checkpoint。Executor 崩溃后新进程用同一 `thread_id` 恢复，只重跑 Executor，不会重新规划/生成（`tests/test_postgres_checkpointer.py` 里用「没有任何回复的 LLM」证明）。
-- **HITL**：`interrupt_before=["deployer"]`；Deployer 自身还会检查 `approved_by_human is True`，即使被误恢复也不会部署。回滚 = 从历史 checkpoint `aupdate_state` 分叉。
-- **模型分层**：`ROLE_TIER` 显式表（planner/reviewer→便宜模型，coder→强模型）。简历里写的 `RunnableWithMessageHistory` 管的是会话历史，不是路由，这里没用它；`ModelRouter.usage` 按层统计真实 token。
-- **MCP**：`@mcp_tool` + `autodiscover`：新增工具 = 在 `tools/` 加一个文件。docstring 的 `Args:` 被解析成 schema 的 description，并保证与 FastMCP 实际下发的 schema 一致（有测试）。同时暴露 SSE 与 streamable HTTP。
-- **终端加固**：容器 `--cap-drop ALL`、`no-new-privileges`、自定义 seccomp、只读根文件系统、`--network none`、非 root、pids/内存/CPU 限额；超时用进程组 + `docker kill` 双保险。`terminal_start/logs/kill` 提供异步 PID 与增量日志。
-- **seccomp 怎么来的**：`scripts/gen_seccomp.py` 以 Docker 默认 allowlist（默认拒绝）为底，删掉 `ptrace`/`process_vm_*`/`kcmp`/`pidfd_getfd` 等跨进程与遗留调用，socket 只留 UNIX/INET/INET6/NETLINK；`mount/unshare/setns/bpf` 等仍由 cap 门控，配合 `--cap-drop ALL` 被拒。
-- **FaaS**：部署容器只在 `internal: true` 的 docker 网络里（无出网），Nginx 同时挂两张网；每个应用生成一个 server block，用 Docker DNS 变量式 `proxy_pass`，写入 → `nginx -t` → `reload`，任何一步失败回滚容器和配置。
-- **浏览器**：DOM 精简（去 script/style/nav/footer/cookie 横幅等，保留标题/段落/代码/链接，限长）；URL 过滤挡住回环、内网、链路本地（云元数据 169.254.169.254）和非 http(s)，只放行自家 `FAAS_DOMAIN`。
-- **混合检索**：BM25（标识符按 snake/Camel 拆分，中文用字符 bigram）+ BGE-M3 稠密向量（Faiss 精确内积），RRF（k=60）融合，再用 bge-reranker 重排前 30。`rag.eval` 一次输出 bm25 / dense / hybrid / hybrid+rerank 四档的 Recall@k 与 MRR@k。
+The evaluation set is synthetic. `scripts/gen_eval.py` asks an LLM to write one question per sampled chunk, and `scripts/refine_eval.py` audits them (dropping vague or multi-answer questions) and extracts verbatim evidence sentences. A retrieved chunk counts as relevant when it comes from the right file and contains at least 80% of the evidence's word 4-grams, so the labels do not depend on how the text was chunked. Questions are split 50/50 into dev (used for tuning) and test (reported once).
 
-## 简历里的数字怎么测出来（别直接抄）
+Corpus: LangGraph and pydantic documentation, 893 chunks. Test split: 196 questions. Recall@k is the fraction of questions whose relevant chunk appears in the top k; MRR@10 rewards earlier ranks.
 
-| 简历说法 | 现在能怎么真实测量 |
-|---|---|
-| 启动 5 分钟 → <10 秒 | `scripts/build_sandbox.sh`：冷/热构建耗时 + 10 次容器启动均值。「5 分钟」需要你自己造基线（每次现装依赖） |
-| 召回 92% | 自己标 50–200 条 query→相关 chunk 的评测集，跑 `python -m rag.eval --queries ...`，说清 Recall@几、是 hit-rate 还是 strict |
-| token 成本 -40% | 同一批任务跑两遍（全用强模型 vs 分层），比较 `router.usage` 的 token 与实际账单 |
-| 工程开销 -30% / 工具接入 -70% | 没有可复现的度量方式就不要写数字，改写成可验证的事实（如「新增工具只需 1 个文件、约 N 行」） |
+| Method | Recall@1 | Recall@5 | Recall@10 | MRR@10 |
+|---|---|---|---|---|
+| BM25 | 0.515 | 0.801 | 0.842 | 0.626 |
+| Dense (BGE-M3) | 0.602 | 0.806 | 0.862 | 0.692 |
+| Hybrid (RRF) | 0.633 | 0.867 | 0.934 | 0.740 |
+| Hybrid + rerank (top 30) | **0.724** | **0.934** | **0.974** | **0.819** |
 
-## 已验证 / 未验证
+The 95% Wilson interval for hybrid + rerank Recall@5 is [0.890, 0.961]. Heading chunking, header context and a larger rerank pool (50) gave no reliable gain, so the defaults stay as above. These numbers come from a synthetic question set and one corpus; treat them as a comparison between methods, not an absolute accuracy.
 
-- 已在无 Docker 守护进程的环境里跑通：图的所有分支（含重试上限、回滚、审批）、真实 MCP 服务器 SSE + streamable HTTP 往返、真实代码执行与 stderr 回灌、Postgres 16 上的崩溃恢复、混合检索与评测逻辑、seccomp 配置属性、FaaS/Nginx 编排（用假 docker）。
-- **未在本环境验证**（需要你的机器）：真实 Docker 加固（`tests/test_docker_integration.py` 会自动在有 Docker 时执行）、Playwright 真实浏览器、OpenAI 实际调用、BGE-M3 / reranker 实际效果、Nginx 真正 reload。
-- Postgres 数据库必须是 UTF8 编码（官方 `postgres` 镜像默认是）；SQL_ASCII 会让 LangGraph 的 checkpoint id 变成 bytes 而丢失 checkpoint。
+Reproduce:
+
+```bash
+python scripts/gen_eval.py            # writes data/eval.jsonl
+python scripts/refine_eval.py         # writes data/eval_clean.jsonl (dev/test split)
+python -m rag.eval --split test       # per-method table with confidence intervals
+python scripts/rag_ablation.py        # chunking / header / pool-size ablation
+```
+
+## Tests
+
+```bash
+pytest -q                                                    # no Docker or Postgres needed
+TEST_POSTGRES_URI=postgresql://agent:agent@localhost:5433/agent pytest tests/test_postgres_checkpointer.py
+bash scripts/build_sandbox.sh && pytest tests/test_docker_integration.py -v    # real hardened containers
+```
+
+Coverage: every graph branch (retry cap, rollback, approval, library vs service), MCP round trips over SSE and streamable HTTP, real code execution with stderr feedback, crash recovery on Postgres 16, seccomp profile properties, FaaS and Nginx orchestration, browser DOM trimming and SSRF rules, retrieval and evaluation logic.
+
+## Known gaps
+
+- Terminal logs are polled, not streamed.
+- The Coder does not yet call `search_docs`, and deployments are not yet checked automatically with `ui_check`.
+- Python only for deployment; no network inside the sandbox.
+- A deployed container once disappeared a few minutes after start while its Nginx config remained. The cause was not found and it did not recur.
+- The Postgres database must use UTF8. With SQL_ASCII, LangGraph checkpoint ids come back as bytes and checkpoints are lost.
